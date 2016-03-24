@@ -1,0 +1,647 @@
+"""
+PyNetCDF
+
+CORRECT: http://www.unidata.ucar.edu/software/netcdf/docs/file_format_specifications.html
+OLD and WRONG: http://www.unidata.ucar.edu/software/netcdf/netcdf-4/newdocs/netcdf.pdf
+
+Others:
+www.unidata.ucar.edu/software/netcdf/docs/netcdf/Classic-Format-Spec.html
+http://www.unidata.ucar.edu/software/netcdf/docs/netcdf_data_set_components.html
+http://www.unidata.ucar.edu/software/netcdf/netcdf/Parts-of-a-NetCDF-Classic-File.html#Parts-of-a-NetCDF-Classic-File
+http://www.unidata.ucar.edu/software/netcdf/netcdf/File-Format-Specification.html#File-Format-Specification
+http://www.unidata.ucar.edu/software/netcdf/docs/file_format_specifications.html
+
+Karim Bahgat, 2016
+"""
+
+import struct
+
+class NetCDFClassic(object):
+
+
+    # options
+    endian = ">" # big endian
+
+
+    # Constants
+
+    ZERO = b"\x00\x00\x00\x00"
+    STREAMING = b"\xFF\xFF\xFF\xFF"
+    NC_DIMENSION = b"\x00\x00\x00\x0A"
+    NC_VARIABLE = b"\x00\x00\x00\x0B"
+    NC_ATTRIBUTE = b"\x00\x00\x00\x0C"
+    PADDING_HEADER = b"\x00"
+
+
+    # Dictionary loopups
+
+    formatcodes = {b"\x01": "classic format",
+                   b"\x02": "64-bit offset format"}
+
+    dtypecodes = {   b"\x00\x00\x00\x01": "NC_BYTE",
+                     b"\x00\x00\x00\x02": "NC_CHAR",
+                     b"\x00\x00\x00\x03": "NC_SHORT",
+                     b"\x00\x00\x00\x04": "NC_INT",
+                     b"\x00\x00\x00\x05": "NC_FLOAT",
+                     b"\x00\x00\x00\x06": "NC_DOUBLE",
+                     }
+
+    dtype_sizes = {"NC_BYTE": 1,
+                   "NC_CHAR": 2,
+                   "NC_SHORT": 2,
+                   "NC_INT": 4,
+                   "NC_FLOAT": 4,
+                   "NC_DOUBLE": 8,
+                   }
+               
+    tags = {"STREAMING": STREAMING,
+            "ZERO": ZERO,
+            "ABSENT": ZERO+ZERO,
+            "NC_DIMENSION": NC_DIMENSION,
+            "NC_ATTRIBUTE": NC_ATTRIBUTE,
+            "NC_VARIABLE": NC_VARIABLE,
+            "PADDING_HEADER": PADDING_HEADER,
+            }
+
+
+    ################################################
+
+    def __init__(self, filepath):
+        self.fileobj = open(filepath, "rb")
+        self.fileobj.seek(0)
+
+        self.read_header()
+
+
+    # Basic reading
+
+    def read_struct_type(self, struct_type, n):
+        fmt = self.endian + bytes(n) + struct_type
+        size = struct.calcsize(fmt)
+        raw = self.read_bytes(size)
+        value = struct.unpack(fmt, raw)
+        if len(value) == 1:
+            value = value[0]
+        return value
+
+    def read_chars(self, n):
+        fmt = self.endian + bytes(n) + "s"
+        size = struct.calcsize(fmt)
+        raw = self.read_bytes(size)
+        value = struct.unpack(fmt, raw)
+        return value[0] # unpack returns a tuple
+
+    def read_short(self, n):
+        value = self.read_struct_type("h", n)
+        return value
+
+    def read_int(self, n):
+        value = self.read_struct_type("i", n)
+        return value
+
+    def read_float(self, n):
+        value = self.read_struct_type("f", n)
+        return value
+
+    def read_double(self, n):
+        value = self.read_struct_type("d", n)
+        return value
+
+    def read_bytes(self, n):
+        raw = self.fileobj.read(n)
+        return raw
+
+
+    # Header specific reading
+
+    def read_chars_header(self, n):
+        value = self.read_chars(n)
+        self.read_size_leftover_padding_header(n)
+        return value
+
+    def read_bytes_header(self, n):
+        value = self.read_bytes(n)
+        self.read_size_leftover_padding_header(n)
+        return value
+
+    def read_short_header(self, n):
+        value = self.read_struct_type("h", n)
+        size = 2 * n   # a single short value is 2 bytes
+        self.read_size_leftover_padding_header(size)
+        return value
+
+
+    # Positioning
+
+    def set_checkpoint(self):
+        self.pos = self.fileobj.tell()
+
+    def return_to_checkpoint(self):
+        self.fileobj.seek(self.pos, 0) # absolute position
+
+    def read_size_leftover_padding_header(self, size):
+        remainder = size % 4 # distance to next 4-byte
+        if remainder:
+            padding = 4 - remainder
+            for _ in range(padding):
+                padfound = self.read_tag("PADDING_HEADER")
+                if not padfound:
+                    raise Exception("Attempted to skip a byte as padding, but the byte did not have the padding signature")
+
+    def round_nearest_4byte_boundary(self, size):
+        padding = self.padding_to_nearest_4byte_boundary(size)
+        if padding:
+            size += padding
+        return size
+
+    def padding_to_nearest_4byte_boundary(self, size):
+        remainder = size % 4 # distance to next 4-byte
+        if remainder:
+            padding = 4 - remainder
+            return padding
+        
+    
+
+    # Convenience
+    
+    def read_tag(self, tag):
+        tagcode = self.tags[tag]
+        tagsize = len(tagcode)
+        raw = self.read_bytes(tagsize)
+        if raw == tagcode:
+            return tag
+
+    def read_alternatives(self, *alternatives):
+        """
+        When there are multiple alternative method readings to be tried.
+        Returns the first non-None result.
+        """
+        self.set_checkpoint()
+        
+        for alt in alternatives:
+            result = alt()
+            
+            if result != None:
+                return result
+
+            self.return_to_checkpoint()
+
+        else:
+            raise Exception("Did not find any of the required alternatives.")
+
+
+    # Multi Use
+
+    def read_non_neg(self):
+        return self.read_struct_type("I", 1) #unsigned ints
+
+    def read_nelems(self):
+        return self.read_non_neg()
+
+    def read_name(self):
+        nelems = self.read_nelems()
+        namestring = self.read_namestring(nelems)
+        return namestring
+
+    def read_namestring(self, nelems): 
+        # first character
+##        namestring = ""
+##        namestring += self.read_id1()
+##
+##        # subsequent items
+##        for _ in range(nelems - 1):
+##            namestring += self.read_idn()
+
+        # alternatively just read full string of length nelems
+        namestring = self.read_chars(nelems)
+
+        # validate it with regex
+        # ...
+
+        # possibly decode to utf8
+        # ...
+
+        # skip padding to next 4-byte boundary
+        self.read_size_leftover_padding_header(nelems)
+
+        return namestring
+
+    def read_id1(self):
+        id1 = self.read_struct_type("s", 1)[0]
+        
+        if self.check_alphanumeric(id1):
+            pass
+        elif id1 == "_":
+            pass
+        else:
+            raise Exception("ID1 must be either alphanumeric or an underscore")
+
+        return id1
+
+    def read_idn(self):
+        idn = self.read_struct_type("s", 1)[0]
+        
+        if self.check_alphanumeric(idn):
+            pass
+        elif idn in "_.@+-": # special 1
+            pass
+        elif idn in """ !"#$%&\()*,:;<=>?[\\]^'{|}~""": # special 2
+            pass
+        else:
+            raise Exception("IDN must be either alphanumeric or a special character of type 1 or 2")
+
+        return idn
+
+    def check_alphanumeric(self, char):
+        if char.isalnum(): # assumes this captures multibyte encoded chars
+            return char
+        else:
+            return False
+
+    def read_nc_type(self):
+        nc_type = self.read_bytes(4)
+        nc_type = self.dtypecodes[nc_type]
+        return nc_type
+
+    def read_values(self, dtype, n):
+        if dtype == "NC_BYTE":
+            values = self.read_bytes_header(n)
+        elif dtype == "NC_CHAR":
+            values = self.read_chars_header(n)
+        elif dtype == "NC_SHORT":
+            values = self.read_short_header(n)
+        else:
+            struct_type = dict(NC_SHORT="h",
+                               NC_INT="i",
+                               NC_FLOAT="f",
+                               NC_DOUBLE="d",
+                               )[dtype]
+            values = self.read_struct_type(struct_type, n)
+        return values
+
+    ##########
+    # Header
+    ##########
+
+    def read_header(self):
+        self.header = dict()
+        self.header.update( magic = self.read_magic(),
+                            numrecs = self.read_numrecs()
+                            )
+        self.header.update( dim_list = self.read_dim_list() )
+        self.header.update( gatt_list = self.read_gatt_list() )
+        self.header.update( var_list = self.read_var_list() )
+
+        return self.header
+
+
+    # MISC
+
+    def read_magic(self):
+        chars = self.read_chars(3)
+        if not chars == "CDF":
+            raise Exception("Magic number must start with the characters C, D, F")
+        versioncode = self.read_bytes(1)
+        version = self.formatcodes[versioncode]
+        return chars,version
+
+    def read_numrecs(self):
+        numrecs = self.read_alternatives(lambda: self.read_tag("STREAMING"),
+                                         self.read_non_neg,
+                                         )
+        return numrecs
+
+
+    # DIM LIST
+
+    def read_dim_list(self):
+        tag = self.read_alternatives(lambda: self.read_tag("ABSENT"),
+                                      lambda: self.read_tag("NC_DIMENSION"),
+                                      )
+        if tag == "ABSENT":
+            dim_list = []
+            
+        elif tag == "NC_DIMENSION":
+            nelems = self.read_nelems()
+            dim_list = [self.read_dim() for _ in range(nelems)]
+            
+        return dim_list
+
+    def read_dim(self):
+        dimdict = dict( name = self.read_name(),
+                        dim_length = self.read_dim_length(),
+                        )
+        return dimdict
+
+    def read_dim_length(self):
+        dim_length = self.read_non_neg()
+        return dim_length
+
+
+    # GATT LIST
+
+    def read_gatt_list(self):
+        gatt_list = self.read_att_list()
+        return gatt_list
+
+
+    # ATT LIST
+
+    def read_att_list(self):
+        tag = self.read_alternatives(lambda: self.read_tag("ABSENT"),
+                                      lambda: self.read_tag("NC_ATTRIBUTE"),
+                                      )
+        if tag == "ABSENT":
+            att_list = []
+            
+        elif tag == "NC_ATTRIBUTE":
+            nelems = self.read_nelems()
+            att_list = [self.read_att() for _ in range(nelems)]
+            
+        return att_list
+
+    def read_att(self):
+        attdict = dict(name = self.read_name(),
+                        nc_type = self.read_nc_type(),
+                        nelems = self.read_nelems(),
+                        )
+        attdict["values"] = self.read_values(attdict["nc_type"], attdict["nelems"])
+        return attdict
+
+
+    # VAR LIST
+
+    def read_var_list(self):
+        tag = self.read_alternatives(lambda: self.read_tag("ABSENT"),
+                                      lambda: self.read_tag("NC_VARIABLE"),
+                                      )
+        if tag == "ABSENT":
+            var_list = []
+            
+        elif tag == "NC_VARIABLE":
+            nelems = self.read_nelems()
+            var_list = [self.read_var() for _ in range(nelems)]
+            
+        return var_list
+
+    def read_var(self):
+        vardict = dict( name = self.read_name(),
+                        nelems = self.read_nelems(),
+                        )
+        vardict.update(
+                        dimids = self.read_dimids(vardict["nelems"]),
+                        vatt_list = self.read_vatt_list(),
+                        nc_type = self.read_nc_type(),
+                        vsize = self.read_vsize(),
+                        begin = self.read_begin(),
+                        )
+        return vardict
+
+    def read_dimids(self, nelems):
+        dimids = [self.read_dimid() for _ in range(nelems)]
+        return dimids
+
+    def read_dimid(self):
+        dimid = self.read_non_neg()
+        return dimid
+
+    def read_vatt_list(self):
+        vatt_list = self.read_att_list()
+        return vatt_list
+
+    def read_vsize(self):
+        vsize = self.read_non_neg()
+        return vsize
+
+    def read_begin(self):
+        begin = self.read_offset()
+        return begin
+
+    def read_offset(self):
+        if self.header["magic"][-1] == "classic format":
+            offset = self.read_non_neg()
+        elif self.header["magic"][-1] == "64-bit offset format":
+            offset = self.read_struct_type("q", 1)
+        return offset
+
+    ########
+    # Data
+    ########
+
+    def read_dimension_values(self, dimname):
+        # only a single list of values, ie coordinate variables
+        # ...
+        pass
+
+    def read_2ddata(self, varname, xdim="longitude", ydim="latitude", **extradims):
+        varinfo = self.get_varinfo(varname)
+        xdiminfo = self.get_diminfo(xdim)
+        ydiminfo = self.get_diminfo(ydim)
+
+        dtype = varinfo["nc_type"]
+        dtypesize = self.dtype_sizes[dtype]
+
+        recvar = self.header["dim_list"][varinfo["dimids"][0]]["dim_length"] == 0
+        if recvar:
+            recsize = self.calc_recsize()
+
+        # TODO: something to do with padding after each record if only one record variable
+        # ...
+
+        # calculate product vector
+        product_vector = self.calc_product_vector(varname)
+
+        # TODO: ensure that extradims and the x and y dims together contains indexes for all dimensions of the variable
+        # ...
+
+        # TODO: allow extradims to reference the actual dimension values by looking it up in its coordinate variable values
+        # ...
+
+        # find each value one at a time by computing offsets
+        begin = varinfo["begin"]
+        rows = []
+        for y in range(ydiminfo["dim_length"]):
+            row = []
+            for x in range(xdiminfo["dim_length"]):
+                indexdict = {xdim:x, ydim:y}
+                indexdict.update(**extradims)
+
+                #
+                coord = [indexdict[self.header["dim_list"][dimid]["name"]] for dimid in varinfo["dimids"]] # aka index list for desired value
+                #print coord,product_vector
+                offset = sum(( coordindex*prodvec for coordindex,prodvec in zip(coord,product_vector) ))
+                #print offset
+
+                #
+                offset *= dtypesize
+                #print offset
+
+                #
+                offset += begin
+                #print begin
+                #print offset
+
+                #
+                if recvar:
+                    recnum = coord[0]
+                    offset += recnum * recsize
+                    #print offset
+
+                # fetch the data
+                self.fileobj.seek(offset, 0)
+                n = 1
+                if dtype == "NC_CHAR":
+                    value = self.read_chars(n)
+                elif dtype == "NC_SHORT":
+                    value = self.read_short(n)
+                elif dtype == "NC_INT":
+                    value = self.read_int(n)
+                elif dtype == "NC_FLOAT":
+                    value = self.read_float(n)
+                elif dtype == "NC_DOUBLE":
+                    value = self.read_double(n)
+
+                # TODO: handle fill values
+                # ...
+
+                # apply transformations to value if given in attributes
+                attr = self.get_varattr(varname, "scale_factor")
+                if attr is not None:
+                    value *= attr
+
+                attr = self.get_varattr(varname, "add_offset")
+                if attr is not None:
+                    value += attr
+
+                # add value
+                    
+                row.append(value)
+
+            rows.append(row)
+
+        # OPTIMIZATION: alternatively find the byte interval between every value to be read,
+        # and instead batch read all values at once using a slice with a step value,
+        # potentially implemented via a memoryview for optimal efficiency.
+        # ...
+
+        return rows
+
+    def calc_product_vector(self, varname):
+        varinfo = self.get_varinfo(varname)
+        dimidlengths = [self.header["dim_list"][dimid]["dim_length"] for dimid in varinfo["dimids"]]
+        product_vector = []
+        prevlength = 1
+        for dimidlength in reversed(dimidlengths):
+            cumulprod = prevlength * dimidlength
+            product_vector.append(cumulprod)
+            prevlength = cumulprod
+        product_vector = list(reversed(product_vector))
+
+        recvar = self.header["dim_list"][varinfo["dimids"][0]]["dim_length"] == 0
+        if recvar:
+            product_vector[0] = 0
+
+        return product_vector
+
+    def calc_recsize(self):
+        recvars = self.get_record_variables()
+        recsize = sum((self.calc_vsize(varinfo["name"]) for varinfo in recvars))
+        return recsize
+
+    def calc_vsize(self, varname):
+        product_vector = self.calc_product_vector(varname)
+        varinfo = self.get_varinfo(varname)
+        dtypesize = self.dtype_sizes[varinfo["nc_type"]]
+        vsize = max(product_vector) * dtypesize
+        print "vsize", product_vector, vsize, self.get_varinfo(varname)["vsize"]
+        vsize = self.round_nearest_4byte_boundary(vsize)
+        return vsize
+
+    #############
+    # Meta utilities
+    #############
+
+    def get_varinfo(self, varname):
+        for vardict in self.header["var_list"]:
+            if varname == vardict["name"]:
+                return vardict
+
+    def get_varattr(self, varname, attr):
+        for attrdict in self.get_varinfo(varname)["vatt_list"]:
+            if attr == attrdict["name"]:
+                return attrdict["values"]
+
+    def get_diminfo(self, dimname):
+        for dimdict in self.header["dim_list"]:
+            if dimname == dimdict["name"]:
+                return dimdict
+
+    def get_record_dimension(self):
+        for dimdict in self.header["dim_list"]:
+            if dimdict["dim_length"] == 0:
+                return dimdict
+
+    def get_nonrecord_variables(self):
+        record_vars = self.get_record_variables()
+        nonrecord_vars = [var for var in self.header["var_list"] if var not in record_vars]
+        return nonrecord_vars
+
+    def get_record_variables(self):
+        record_vars = []
+        coord_vars = self.get_coordinate_variables()
+        
+        for vardict in self.header["var_list"]:
+            dimids = vardict["dimids"]
+            dimid = dimids[0] # must be first dimension 
+            diminfo = self.header["dim_list"][dimid]
+            if diminfo["dim_length"] == 0 and vardict["name"] not in (v["name"] for v in coord_vars): 
+                # record variables are those whose first dimension has a length of 0, ie unlimited
+                # and that are not a coordinate variable
+                record_vars.append(vardict)
+
+        return record_vars
+
+    def get_coordinate_variables(self):
+        coord_vars = []
+        
+        for vardict in self.header["var_list"]:
+            dimids = vardict["dimids"]
+            if len(dimids) == 1:
+                dimid = dimids[0]
+                diminfo = self.header["dim_list"][dimid]
+                if vardict["name"] == diminfo["name"]:
+                    # coordinate variables are those with only a single dimension and the same name as that same dimension
+                    coord_vars.append(vardict)
+
+        return coord_vars
+
+
+if __name__ == "__main__":
+    filepath = "ECMWF_ERA-40_subset.nc"
+    obj = NetCDFClassic(filepath)
+
+    import pprint
+    #pprint.pprint(obj.header)
+
+    varname = "tcw"
+    varinfo = obj.get_varinfo(varname)
+    pprint.pprint(varinfo)
+    rows = obj.read_2ddata(varname, time=0) # temperature kalvin
+    print repr(rows)[:900]
+    print repr(rows[::50])[:900]
+    print repr(rows)[-900:]
+    print len(rows), len(rows[0])
+
+    import PIL, PIL.Image
+    img = PIL.Image.new("F",(len(rows[0]),len(rows)))
+    pxls = img.load()
+    #img.putdata([v for row in rows for v in row])
+    for y,row in enumerate(rows):
+        for x,v in enumerate(row):
+            #print x,y
+            pxls[x,y] = v
+    img = img.convert("L")
+    print img.getcolors()
+    img.show()
+
+    
