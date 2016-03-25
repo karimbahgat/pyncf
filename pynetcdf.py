@@ -1,14 +1,31 @@
 """
 PyNetCDF
 
-CORRECT: http://www.unidata.ucar.edu/software/netcdf/docs/file_format_specifications.html
-OLD and WRONG: http://www.unidata.ucar.edu/software/netcdf/netcdf-4/newdocs/netcdf.pdf
+Pure Python NetCDF file reading and writing.
 
-Others:
-www.unidata.ucar.edu/software/netcdf/docs/netcdf/Classic-Format-Spec.html
-http://www.unidata.ucar.edu/software/netcdf/docs/netcdf_data_set_components.html
-http://www.unidata.ucar.edu/software/netcdf/netcdf/Parts-of-a-NetCDF-Classic-File.html#Parts-of-a-NetCDF-Classic-File
-http://www.unidata.ucar.edu/software/netcdf/netcdf/File-Format-Specification.html#File-Format-Specification
+Note: Currently only support for reading, no writing, and the Classic and 64-bit formats.
+
+# Introduction
+
+Inspired by the pyshp library, which provides simple pythonic and dependency free data access to vector data,
+I decided to create a library for an increasingly popular file format in the raster part of the GIS world,
+namely, NetCDF. From landuse to climate data, data sought after by gis practioners are increasingly often
+found only in the NetCDF format. Existing NetCDF libraries for python all rely on interfacing with
+underlying c based implementations and can be hard to setup outside the context of a full GDAL stack.
+But most of the complexity of the format is in reading the metadata in the header, which makes it easy
+to implement in python without having to suffer from the slowness of python. Reading the actual data,
+which NetCDF can store a lot of, is where one might argue that a C implementation is needed for reasons
+of speed. But given that the main purpose of the format data model is to provide efficient access to
+any part of its vast data without having to read all of it via byte offset pointers, this too can be
+easily and relatively efficiently implemented in python without significant slowdowns. Besides, in
+many cases, the main use of NetCDF is not for storing enormously vast raster arrays, but rather for
+storing multiple relatively small raster arrays on different themes, and of providing variations of
+these across some dimension, such as time. All of this makes it feasible and desirable with a pure
+python implementation for reading and writing NetCDF files, expanding access to the various data
+sources now using this format to a much broader set of users and applications, especially in portable
+environments. 
+
+Based on description at:
 http://www.unidata.ucar.edu/software/netcdf/docs/file_format_specifications.html
 
 Karim Bahgat, 2016
@@ -204,19 +221,19 @@ class NetCDFClassic(object):
         return namestring
 
     def read_namestring(self, nelems): 
-        # first character
-##        namestring = ""
-##        namestring += self.read_id1()
-##
-##        # subsequent items
-##        for _ in range(nelems - 1):
-##            namestring += self.read_idn()
-
         # alternatively just read full string of length nelems
         namestring = self.read_chars(nelems)
 
-        # validate it with regex
-        # ...
+        # check has at least one char
+        assert len(namestring) > 0
+
+        # validate first character
+        self.check_id1(namestring[0])
+
+        # validate subsequent items
+        if len(namestring) > 1:
+            for char in namestring[1:]:
+                self.check_idn(char)
 
         # possibly decode to utf8
         # ...
@@ -226,9 +243,7 @@ class NetCDFClassic(object):
 
         return namestring
 
-    def read_id1(self):
-        id1 = self.read_struct_type("s", 1)[0]
-        
+    def check_id1(self, id1):        
         if self.check_alphanumeric(id1):
             pass
         elif id1 == "_":
@@ -238,9 +253,7 @@ class NetCDFClassic(object):
 
         return id1
 
-    def read_idn(self):
-        idn = self.read_struct_type("s", 1)[0]
-        
+    def check_idn(self, idn):        
         if self.check_alphanumeric(idn):
             pass
         elif idn in "_.@+-": # special 1
@@ -434,14 +447,28 @@ class NetCDFClassic(object):
         pass
 
     def read_2ddata(self, varname, xdim="longitude", ydim="latitude", **extradims):
+        """
+        Extracts a 2-dimensional grid as a list of lists, with xdim increasing to the right (row values),
+        and ydim increasing downwards (rows). 
+        Must ensure that extradims fixes all other dimensions at a specified value.
+        Possible to mix and mash dimensions, just remember to update the extradims accordingly. 
+        """
         varinfo = self.get_varinfo(varname)
         xdiminfo = self.get_diminfo(xdim)
         ydiminfo = self.get_diminfo(ydim)
 
+        # get dtype and size
         dtype = varinfo["nc_type"]
         dtypesize = self.dtype_sizes[dtype]
 
-        recvar = self.header["dim_list"][varinfo["dimids"][0]]["dim_length"] == 0
+        # detect if record variable
+        recvar = varinfo["name"] in (rv["name"] for rv in self.get_record_variables())
+
+        # however, dont treat as record variable if using the record dimension as one of the two dimensions to extract
+        firstdim = self.header["dim_list"][varinfo["dimids"][0]]
+        recvar = firstdim["name"] not in (xdim,ydim)
+
+        # calculate record size
         if recvar:
             recsize = self.calc_recsize()
 
@@ -450,6 +477,9 @@ class NetCDFClassic(object):
 
         # calculate product vector
         product_vector = self.calc_product_vector(varname)
+        product_vector.append(1) # add 1 to allow the last coordinate to stay as is
+        product_vector = product_vector[1:] # skew one to the left, so will line up with one higher dimension
+        if recvar: product_vector = product_vector[1:] # skew again because the coordinate vector will drop its record coordinate
 
         # TODO: ensure that extradims and the x and y dims together contains indexes for all dimensions of the variable
         # ...
@@ -458,18 +488,26 @@ class NetCDFClassic(object):
         # ...
 
         # find each value one at a time by computing offsets
+        # TODO: calculate number of records if numrecs is STREAMING
         begin = varinfo["begin"]
         rows = []
-        for y in range(ydiminfo["dim_length"]):
+        xdimlength = xdiminfo["dim_length"] or self.header["numrecs"] # record dimensions have length 0, so must use number of records
+        ydimlength = ydiminfo["dim_length"] or self.header["numrecs"] # record dimensions have length 0, so must use number of records
+        for y in range(ydimlength):
             row = []
-            for x in range(xdiminfo["dim_length"]):
+            for x in range(xdimlength):
                 indexdict = {xdim:x, ydim:y}
                 indexdict.update(**extradims)
 
                 #
                 coord = [indexdict[self.header["dim_list"][dimid]["name"]] for dimid in varinfo["dimids"]] # aka index list for desired value
-                #print coord,product_vector
-                offset = sum(( coordindex*prodvec for coordindex,prodvec in zip(coord,product_vector) ))
+                if recvar: 
+                    coord_mod = coord[1:] # drop the record coordinate so doesnt affect calculation
+                else:
+                    coord_mod = list(coord) 
+                #print coord,coord_mod,product_vector
+                
+                offset = sum(( coordindex*prodvec for coordindex,prodvec in zip(coord_mod,product_vector) ))
                 #print offset
 
                 #
@@ -518,7 +556,7 @@ class NetCDFClassic(object):
                 row.append(value)
 
             rows.append(row)
-
+            
         # OPTIMIZATION: alternatively find the byte interval between every value to be read,
         # and instead batch read all values at once using a slice with a step value,
         # potentially implemented via a memoryview for optimal efficiency.
@@ -546,6 +584,7 @@ class NetCDFClassic(object):
     def calc_recsize(self):
         recvars = self.get_record_variables()
         recsize = sum((self.calc_vsize(varinfo["name"]) for varinfo in recvars))
+        recsize = self.round_nearest_4byte_boundary(recsize)
         return recsize
 
     def calc_vsize(self, varname):
@@ -623,7 +662,7 @@ if __name__ == "__main__":
     import pprint
     #pprint.pprint(obj.header)
 
-    varname = "tcw"
+    varname = "tcw" #msl,tcc,p2t,tcw
     varinfo = obj.get_varinfo(varname)
     pprint.pprint(varinfo)
     rows = obj.read_2ddata(varname, time=0) # temperature kalvin
@@ -640,8 +679,10 @@ if __name__ == "__main__":
         for x,v in enumerate(row):
             #print x,y
             pxls[x,y] = v
-    img = img.convert("L")
-    print img.getcolors()
-    img.show()
+
+    import pythongis as pg
+    rast = pg.raster.data.RasterData(image=img, cellwidth=1, cellheight=-1, xy_cell=(0,0), xy_geo=(0,0))
+    rast.view(1000,500,gradcolors=[(0,255,0),(255,255,0),(255,0,0)])
+
 
     
