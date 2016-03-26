@@ -1,39 +1,124 @@
 """
-PyNetCDF
+# PyNetCDF
 
 Pure Python NetCDF file reading and writing.
 
-Note: Currently only support for reading, no writing, and the Classic and 64-bit formats.
-
-# Introduction
+## Introduction
 
 Inspired by the pyshp library, which provides simple pythonic and dependency free data access to vector data,
-I decided to create a library for an increasingly popular file format in the raster part of the GIS world,
-namely, NetCDF. From landuse to climate data, data sought after by gis practioners are increasingly often
-found only in the NetCDF format. Existing NetCDF libraries for python all rely on interfacing with
-underlying c based implementations and can be hard to setup outside the context of a full GDAL stack.
+I wanted to create a library for an increasingly popular file format in the raster part of the GIS world,
+namely, NetCDF. From landuse to climate data, data sought after by GIS practioners are increasingly often
+found only in the NetCDF format.
+
+My problem was that existing NetCDF libraries for python all rely on interfacing with
+underlying C based implementations and can be hard to setup outside the context of a full GDAL stack.
+
 But most of the complexity of the format is in reading the metadata in the header, which makes it easy
-to implement in python without having to suffer from the slowness of python. Reading the actual data,
+to implement in python and should not have to suffer from the slowness of python. Reading the actual data,
 which NetCDF can store a lot of, is where one might argue that a C implementation is needed for reasons
 of speed. But given that the main purpose of the format data model is to provide efficient access to
 any part of its vast data without having to read all of it via byte offset pointers, this too can be
 easily and relatively efficiently implemented in python without significant slowdowns. Besides, in
 many cases, the main use of NetCDF is not for storing enormously vast raster arrays, but rather for
 storing multiple relatively small raster arrays on different themes, and of providing variations of
-these across some dimension, such as time. All of this makes it feasible and desirable with a pure
+these across some dimension, such as time.
+
+All of this makes it feasible and desirable with a pure
 python implementation for reading and writing NetCDF files, expanding access to the various data
 sources now using this format to a much broader set of users and applications, especially in portable
 environments. 
 
-Based on description at:
-http://www.unidata.ucar.edu/software/netcdf/docs/file_format_specifications.html
+## Status
+
+Basic metadata and data extraction functional, but has not been tested very extensively, so likely
+to contain some issues. No file writing implemented yet. Only Classic and 64-bit formats supported so far,
+though NetCDF-4 should be easy to implement. 
+
+## Author
 
 Karim Bahgat, 2016
+
+Based on the file format description at:
+http://www.unidata.ucar.edu/software/netcdf/docs/file_format_specifications.html
+
 """
+
+
+__version__ = "0.1.0"
+
+
 
 import struct
 
-class NetCDFClassic(object):
+
+
+
+# The User Interfaces
+
+class NetCDF(object):
+
+    def __init__(self, filepath):
+
+        # detect format version
+        with open(filepath, "rb") as fileobj:
+            fileobj.read(3) # skip the first three cdf characters
+            formatcode = fileobj.read(1) # the format code
+            formatcodes = {b"\x01": "classic format",
+                           b"\x02": "64-bit offset format"}
+            formatname = formatcodes[formatcode]
+
+        # initialize backend
+        if formatname in ("classic format", "64-bit offset format"):
+            self._backend = _NetCDFClassicBackend(filepath)
+        else:
+            raise Exception("Could not recognize the NetCDF format version")
+
+        # read the header on startup
+        self.header = self._backend.read_header()
+
+
+    ########
+    # Data
+    ########
+
+    def read_dimension_values(self, dimname):
+        return self._backend.read_dimension_values(dimname)
+
+    def read_2d_data(self, varname, xdim="longitude", ydim="latitude", **extradims):
+        return self._backend.read_2d_data(varname, xdim=xdim, ydim=ydim, **extradims)
+
+
+    #############
+    # Meta utilities
+    #############
+
+    def get_varinfo(self, varname):
+        return self._backend.get_varinfo(varname)
+
+    def get_varattr(self, varname, attr):
+        return self._backend.get_varattr(varname, attr)
+
+    def get_diminfo(self, dimname):
+        return self._backend.get_diminfo(dimname)
+
+    def get_record_dimension(self):
+        return self._backend.get_record_dimension()
+
+    def get_nonrecord_variables(self):
+        return self._backend.get_nonrecord_variables()
+
+    def get_record_variables(self):
+        return self._backend.get_record_variables()
+
+    def get_coordinate_variables(self):
+        return self._backend.get_coordinate_variables()
+
+
+
+
+# Backends for the various versions of the format
+
+class _NetCDFClassicBackend(object):
 
 
     # options
@@ -86,8 +171,6 @@ class NetCDFClassic(object):
     def __init__(self, filepath):
         self.fileobj = open(filepath, "rb")
         self.fileobj.seek(0)
-
-        self.read_header()
 
 
     # Basic reading
@@ -442,16 +525,39 @@ class NetCDFClassic(object):
     ########
 
     def read_dimension_values(self, dimname):
-        # only a single list of values, ie coordinate variables
-        # ...
-        pass
-
-    def read_2ddata(self, varname, xdim="longitude", ydim="latitude", **extradims):
         """
-        Extracts a 2-dimensional grid as a list of lists, with xdim increasing to the right (row values),
+        Reads the values from a dimension if it has a corresponding coordinate variable. 
+        """
+        varinfo = self.get_varinfo(dimname)
+        diminfo = self.get_diminfo(dimname)
+
+        # get dtype
+        dtype = varinfo["nc_type"]
+
+        # read values
+        offset = varinfo["begin"]
+        dim_length = diminfo["dim_length"] or self.header["numrecs"]
+
+        self.fileobj.seek(offset, 0)
+        recvar = diminfo["dim_length"] == 0
+        if recvar:
+            recsize = self.calc_recsize()
+            values = []
+            for _ in range(self.header["numrecs"]):
+                values.append(self.read_int(1))
+                self.fileobj.read(recsize) # skip to next record
+        else:
+            values = self.read_values(dtype, dim_length)
+        
+        return values
+
+    def read_2d_data(self, varname, xdim="longitude", ydim="latitude", **extradims):
+        """
+        Extracts a 2-dimensional grid of a variable as a list of lists, with xdim increasing to the right (row values),
         and ydim increasing downwards (rows). 
-        Must ensure that extradims fixes all other dimensions at a specified value.
-        Possible to mix and mash dimensions, just remember to update the extradims accordingly. 
+        Must ensure that extradims keywords fixes all other dimensions at a specified value.
+        Xdim and ydim default to longitude and latitude, but it is possible to mix and mash other dimensions,
+        just remember to set all remaining extradims. 
         """
         varinfo = self.get_varinfo(varname)
         xdiminfo = self.get_diminfo(xdim)
@@ -530,6 +636,8 @@ class NetCDFClassic(object):
                 n = 1
                 if dtype == "NC_CHAR":
                     value = self.read_chars(n)
+                elif dtype == "NC_BYTE":
+                    value = self.read_bytes(n)
                 elif dtype == "NC_SHORT":
                     value = self.read_short(n)
                 elif dtype == "NC_INT":
@@ -552,7 +660,6 @@ class NetCDFClassic(object):
                     value += attr
 
                 # add value
-                    
                 row.append(value)
 
             rows.append(row)
@@ -592,7 +699,6 @@ class NetCDFClassic(object):
         varinfo = self.get_varinfo(varname)
         dtypesize = self.dtype_sizes[varinfo["nc_type"]]
         vsize = max(product_vector) * dtypesize
-        print "vsize", product_vector, vsize, self.get_varinfo(varname)["vsize"]
         vsize = self.round_nearest_4byte_boundary(vsize)
         return vsize
 
@@ -614,6 +720,8 @@ class NetCDFClassic(object):
         for dimdict in self.header["dim_list"]:
             if dimname == dimdict["name"]:
                 return dimdict
+
+    ########
 
     def get_record_dimension(self):
         for dimdict in self.header["dim_list"]:
@@ -657,15 +765,34 @@ class NetCDFClassic(object):
 
 if __name__ == "__main__":
     filepath = "ECMWF_ERA-40_subset.nc"
-    obj = NetCDFClassic(filepath)
+    obj = NetCDF(filepath)
 
     import pprint
     #pprint.pprint(obj.header)
 
-    varname = "tcw" #msl,tcc,p2t,tcw
+    print "----record dimension"
+    pprint.pprint(obj.get_record_dimension())
+
+    #print "----record variables"
+    #pprint.pprint(obj.get_record_variables())
+
+    print "----nonrecord variables"
+    pprint.pprint(obj.get_nonrecord_variables())
+
+    print "----coordinate variables"
+    pprint.pprint(obj.get_coordinate_variables())
+
+    print "----dimension values"
+    print obj.read_dimension_values("time")
+    
+    ###########
+
+    varname = "p2t" #msl,tcc,p2t,tcw
     varinfo = obj.get_varinfo(varname)
+
+    print "----inspecting data:"
     pprint.pprint(varinfo)
-    rows = obj.read_2ddata(varname, time=0) # temperature kalvin
+    rows = obj.read_2d_data(varname, time=10) # temperature kalvin
     print repr(rows)[:900]
     print repr(rows[::50])[:900]
     print repr(rows)[-900:]
