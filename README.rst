@@ -1,5 +1,5 @@
-PyNetCDF
-========
+Pyncf
+=====
 
 Pure Python NetCDF file reading and writing.
 
@@ -43,6 +43,45 @@ Basic metadata and data extraction functional, but has not been tested
 very extensively, so likely to contain some issues. No file writing
 implemented yet. Only Classic and 64-bit formats supported so far,
 though NetCDF-4 should be easy to implement.
+
+Basic usage
+-----------
+
+Documentation is so far a little sparse, so how about some basic
+examples.
+
+Basically, you load some data file which allows access to its meta data
+in the "header" attribute, a dictionary structure based exactly on the
+format specification, which you will just have to explore for now:
+
+::
+
+    import pyncf
+    ncfile = pyncf.NetCDF(filepath="somefile.nc")
+    headerdict = ncfile.header
+
+For more intuitive access to metadata there are also some more specific
+methods for that, all retrieving dictionaries:
+
+::
+
+    ncfile.get_dimensions()
+    nc.get_diminfo("time")
+
+    ncfile.get_nonrecord_variables()
+    ncfile.get_record_variables()
+    nc.get_varinfo("temperature")
+
+When it comes to actual data retrieval, there are two main methods. One
+for reading a dimension's index values if defined in a variable, and
+another for retrieving a 2d list of lists of a multidimensional
+variable's data values, by specifying which two dimensions to get your
+data for and fixing all remaining dimensions at a certain value:
+
+::
+
+    timelabels = ncfile.read_dimension_values("time")
+    datamatrix = ncfile.read_2d_data(ydim="latitude", xdim="longitude", time=43)
 
 Author
 ------
