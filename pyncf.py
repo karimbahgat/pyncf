@@ -597,6 +597,11 @@ class _NetCDFClassicBackend(object):
         # TODO: allow extradims to reference the actual dimension values by looking it up in its coordinate variable values
         # ...
 
+        # TODO OPTIMIZATION: alternatively find the byte interval between every value to be read,
+        # and instead batch read all values at once using a slice with a step value,
+        # potentially implemented via a memoryview for optimal efficiency.
+        # ...
+
         # find each value one at a time by computing offsets
         # TODO: calculate number of records if numrecs is STREAMING
         begin = varinfo["begin"]
@@ -651,7 +656,7 @@ class _NetCDFClassicBackend(object):
                 elif dtype == "NC_DOUBLE":
                     value = self.read_double(n)
 
-                # TODO: handle fill values
+                # TODO: handle fill values?
                 # ...
 
                 # apply transformations to value if given in attributes
@@ -667,11 +672,6 @@ class _NetCDFClassicBackend(object):
                 row.append(value)
 
             rows.append(row)
-            
-        # OPTIMIZATION: alternatively find the byte interval between every value to be read,
-        # and instead batch read all values at once using a slice with a step value,
-        # potentially implemented via a memoryview for optimal efficiency.
-        # ...
 
         return rows
 
@@ -696,6 +696,7 @@ class _NetCDFClassicBackend(object):
         recvars = self.get_record_variables()
         recsize = sum((self.calc_vsize(varinfo["name"]) for varinfo in recvars))
         recsize = self.round_nearest_4byte_boundary(recsize)
+        recsize += 4 # "it always includes padding to the next multiple of 4 bytes"
         return recsize
 
     def calc_vsize(self, varname):
@@ -796,7 +797,7 @@ if __name__ == "__main__":
 
     print "----inspecting data:"
     pprint.pprint(varinfo)
-    rows = obj.read_2d_data(varname, time=10) # temperature kalvin
+    rows = obj.read_2d_data(varname, time=10)
     print repr(rows)[:900]
     print repr(rows[::50])[:900]
     print repr(rows)[-900:]
